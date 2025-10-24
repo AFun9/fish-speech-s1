@@ -27,8 +27,8 @@ from tools.server.views import routes
 
 
 class API(ExceptionHandler):
-    def __init__(self):
-        self.args = parse_args()
+    def __init__(self, args=None):
+        self.args = args if args is not None else parse_args()
 
         def api_auth(endpoint):
             async def verify(token: Annotated[str, Depends(bearer_auth)]):
@@ -93,6 +93,22 @@ class API(ExceptionHandler):
         logger.info(f"Startup done, listening server at http://{self.args.listen}")
 
 
+# Global app instance for uvicorn workers
+_api = None
+
+
+def create_app():
+    """Factory function to create the app instance for uvicorn workers"""
+    global _api
+    if _api is None:
+        _api = API()
+    return _api.app
+
+
+# Create the app instance for import string usage
+app = create_app()
+
+
 # Each worker process created by Uvicorn has its own memory space,
 # meaning that models and variables are not shared between processes.
 # Therefore, any variables (like `llama_queue` or `decoder_model`)
@@ -103,19 +119,30 @@ class API(ExceptionHandler):
 # Instead, it's better to use multiprocessing or independent models per thread.
 
 if __name__ == "__main__":
-    api = API()
+    args = parse_args()
 
     # IPv6 address format is [xxxx:xxxx::xxxx]:port
-    match = re.search(r"\[([^\]]+)\]:(\d+)$", api.args.listen)
+    match = re.search(r"\[([^\]]+)\]:(\d+)$", args.listen)
     if match:
         host, port = match.groups()  # IPv6
     else:
-        host, port = api.args.listen.split(":")  # IPv4
+        host, port = args.listen.split(":")  # IPv4
 
-    uvicorn.run(
-        api.app,
-        host=host,
-        port=int(port),
-        workers=api.args.workers,
-        log_level="info",
-    )
+    if args.workers > 1:
+        # Use import string for multiple workers
+        uvicorn.run(
+            "tools.api_server:app",
+            host=host,
+            port=int(port),
+            workers=args.workers,
+            log_level="info",
+        )
+    else:
+        # Use app instance directly for single worker (faster startup)
+        api = API(args)
+        uvicorn.run(
+            api.app,
+            host=host,
+            port=int(port),
+            log_level="info",
+        )

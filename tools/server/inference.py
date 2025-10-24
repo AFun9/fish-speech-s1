@@ -19,7 +19,7 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
         match result.code:
             case "header":
                 if isinstance(result.audio, tuple):
-                    yield result.audio[1]
+                    yield result.audio[1].tobytes()
 
             case "error":
                 raise HTTPException(
@@ -35,7 +35,14 @@ def inference_wrapper(req: ServeTTSRequest, engine: TTSInferenceEngine):
             case "final":
                 count += 1
                 if isinstance(result.audio, tuple):
-                    yield result.audio[1]
+                    if req.streaming:
+                        # In streaming mode, don't send the final concatenated audio
+                        # since we've already sent all segments as chunks
+                        pass
+                    else:
+                        # In non-streaming mode, return the raw numpy array
+                        # for sf.write() to format properly
+                        yield result.audio[1]
                 return None  # Stop the generator
 
     if count == 0:
