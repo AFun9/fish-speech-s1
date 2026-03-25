@@ -6,7 +6,7 @@ import numpy as np
 import pyrootutils
 import soundfile as sf
 import torch
-import torchaudio
+import torchaudio.functional as F_audio
 from hydra import compose, initialize
 from hydra.utils import instantiate
 from loguru import logger
@@ -75,10 +75,13 @@ def main(input_path, output_path, config_name, checkpoint_path, device):
         logger.info(f"Processing in-place reconstruction of {input_path}")
 
         # Load audio
-        audio, sr = torchaudio.load(str(input_path))
+        raw, sr = sf.read(str(input_path), dtype="float32")
+        audio = torch.from_numpy(raw).T  # (channels, samples) or (samples,)
+        if audio.dim() == 1:
+            audio = audio.unsqueeze(0)
         if audio.shape[0] > 1:
             audio = audio.mean(0, keepdim=True)
-        audio = torchaudio.functional.resample(audio, sr, model.sample_rate)
+        audio = F_audio.resample(audio, sr, model.sample_rate)
 
         audios = audio[None].to(device)
         logger.info(

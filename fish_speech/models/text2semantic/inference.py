@@ -185,12 +185,16 @@ def decode_n_tokens(
     audio_masks: torch.Tensor,
     audio_parts: torch.Tensor,
     decode_one_token=decode_one_token_ar,
+    chunk_length: int = 0,
 ):
     previous_tokens = torch.zeros(
         (model.config.num_codebooks + 1, model.config.max_seq_len),
         dtype=torch.int,
         device=cur_token.device,
     )
+
+    chunk_start = 0
+    i = -1
 
     for i in tqdm(range(num_new_tokens)):
         # We need to get windowed repeat penalty
@@ -221,17 +225,22 @@ def decode_n_tokens(
             model.config.num_codebooks + 1, -1
         )
 
-        if cur_token[0, 0, -1] == model.tokenizer.get_token_id(IM_END_TOKEN):
+        is_eos = cur_token[0, 0, -1] == model.tokenizer.get_token_id(IM_END_TOKEN)
+
+        if chunk_length > 0 and (i + 1 - chunk_start) >= chunk_length and not is_eos:
+            yield previous_tokens[:, chunk_start : i + 1]
+            chunk_start = i + 1
+
+        if is_eos:
             break
 
-    # Only clean up the large tensor
+    # Yield any remaining tokens
+    if i + 1 > chunk_start:
+        yield previous_tokens[:, chunk_start : i + 1]
+
     del cur_token
 
-    return previous_tokens[:, : i + 1]
 
-
-@torch.no_grad()
-@torch.inference_mode()
 def generate(
     *,
     model: DualARTransformer,
@@ -245,109 +254,110 @@ def generate(
 ):
     """
     Takes a conditioning sequence (prompt) as input and continues to generate as many tokens as requested.
+    Yields partial code chunks for streaming.
     """
 
-    # create an empty tensor of the expected final shape and fill in the current tokens
-    T = prompt.size(1)
-    prompt = prompt[None].repeat(num_samples, 1, 1)
+    with torch.inference_mode():
+        T = prompt.size(1)
+        prompt = prompt[None].repeat(num_samples, 1, 1)
 
-    if T >= model.config.max_seq_len:
-        raise ValueError(
-            f"Input sequence length {T} exceeds max_seq_len {model.config.max_seq_len}"
+        if T >= model.config.max_seq_len:
+            raise ValueError(
+                f"Input sequence length {T} exceeds max_seq_len {model.config.max_seq_len}"
+            )
+
+        if max_new_tokens:
+            if T + max_new_tokens > model.config.max_seq_len:
+                max_new_tokens = model.config.max_seq_len - T
+
+            T_new = T + max_new_tokens
+        else:
+            T_new = model.config.max_seq_len
+            max_new_tokens = T_new - T
+
+        device, dtype = prompt.device, prompt.dtype
+
+        if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
+            with torch.device(device):
+                model.setup_caches(
+                    max_batch_size=1,
+                    max_seq_len=model.config.max_seq_len,
+                    dtype=next(model.parameters()).dtype,
+                )
+            model._cache_setup_done = True
+
+        codebook_dim = 1 + model.config.num_codebooks
+
+        input_pos = torch.arange(0, T, device=device, dtype=torch.long)
+        empty = torch.empty(
+            (codebook_dim, model.config.max_seq_len), dtype=dtype, device=device
+        )
+        empty[:, :T] = prompt
+        seq = empty
+
+        temperature = getattr(
+            model, "fixed_temperature", torch.tensor(0.8, device=device, dtype=torch.float)
+        )
+        top_p = getattr(
+            model, "fixed_top_p", torch.tensor(0.8, device=device, dtype=torch.float)
+        )
+        repetition_penalty = getattr(
+            model,
+            "fixed_repetition_penalty",
+            torch.tensor(1.1, device=device, dtype=torch.float),
         )
 
-    if max_new_tokens:
-        if T + max_new_tokens > model.config.max_seq_len:
-            max_new_tokens = model.config.max_seq_len - T
+        temp_val = sampling_kwargs.get("temperature", 0.7)
+        top_p_val = sampling_kwargs.get("top_p", 0.7)
+        rep_val = sampling_kwargs.get("repetition_penalty", 1.5)
 
-        T_new = T + max_new_tokens
-    else:
-        T_new = model.config.max_seq_len
-        max_new_tokens = T_new - T
+        if abs(temperature.item() - temp_val) > 1e-6:
+            temperature.fill_(temp_val)
+        if abs(top_p.item() - top_p_val) > 1e-6:
+            top_p.fill_(top_p_val)
+        if abs(repetition_penalty.item() - rep_val) > 1e-6:
+            repetition_penalty.fill_(rep_val)
 
-    device, dtype = prompt.device, prompt.dtype
+        prefill_decode = decode_one_token_ar
 
-    # Critical fix: Only set up cache on first run or when necessary
-    if not hasattr(model, "_cache_setup_done") or not model._cache_setup_done:
-        with torch.device(device):
-            model.setup_caches(
-                max_batch_size=1,  # Fixed to 1, avoid dynamic changes
-                max_seq_len=model.config.max_seq_len,
-                dtype=next(model.parameters()).dtype,
-            )
-        model._cache_setup_done = True
+        first_token = prefill_decode(
+            model,
+            prompt.view(1, codebook_dim, -1),
+            input_pos,
+            temperature,
+            top_p,
+            repetition_penalty,
+            audio_masks,
+            audio_parts,
+        )
+        seq[:, T : T + 1] = first_token
 
-    codebook_dim = 1 + model.config.num_codebooks
+        input_pos = torch.tensor([T], device=device, dtype=torch.int)
 
-    # Create new tensor each time, but try to reuse memory
-    input_pos = torch.arange(0, T, device=device, dtype=torch.long)
-    empty = torch.empty(
-        (codebook_dim, model.config.max_seq_len), dtype=dtype, device=device
-    )
-    empty[:, :T] = prompt
-    seq = empty
+        chunk_length = sampling_kwargs.get("chunk_length", 0)
+        logger.info(f"Streaming generate: chunk_length={chunk_length}, max_new_tokens={max_new_tokens}")
 
-    # Use pre-created fixed parameter tensors
-    temperature = getattr(
-        model, "fixed_temperature", torch.tensor(0.8, device=device, dtype=torch.float)
-    )
-    top_p = getattr(
-        model, "fixed_top_p", torch.tensor(0.8, device=device, dtype=torch.float)
-    )
-    repetition_penalty = getattr(
-        model,
-        "fixed_repetition_penalty",
-        torch.tensor(1.1, device=device, dtype=torch.float),
-    )
+        offset = T + 1
+        for partial in decode_n_tokens(
+            model,
+            first_token.view(1, codebook_dim, -1),
+            input_pos,
+            max_new_tokens - 1,
+            temperature=temperature,
+            top_p=top_p,
+            repetition_penalty=repetition_penalty,
+            audio_masks=audio_masks,
+            audio_parts=audio_parts,
+            decode_one_token=decode_one_token,
+            chunk_length=chunk_length,
+        ):
+            n = partial.size(1)
+            seq[:, offset : offset + n] = partial
+            offset += n
+            logger.info(f"Yielding chunk: {n} tokens (offset={offset})")
+            yield partial[1:]
 
-    # If different parameter values are needed, directly modify existing tensors
-    temp_val = sampling_kwargs.get("temperature", 0.7)
-    top_p_val = sampling_kwargs.get("top_p", 0.7)
-    rep_val = sampling_kwargs.get("repetition_penalty", 1.5)
-
-    if abs(temperature.item() - temp_val) > 1e-6:
-        temperature.fill_(temp_val)
-    if abs(top_p.item() - top_p_val) > 1e-6:
-        top_p.fill_(top_p_val)
-    if abs(repetition_penalty.item() - rep_val) > 1e-6:
-        repetition_penalty.fill_(rep_val)
-
-    prefill_decode = decode_one_token_ar
-
-    first_token = prefill_decode(
-        model,
-        prompt.view(1, codebook_dim, -1),
-        input_pos,
-        temperature,
-        top_p,
-        repetition_penalty,
-        audio_masks,
-        audio_parts,
-    )
-    seq[:, T : T + 1] = first_token
-
-    # Recreate input_pos
-    input_pos = torch.tensor([T], device=device, dtype=torch.int)
-
-    x = decode_n_tokens(
-        model,
-        first_token.view(1, codebook_dim, -1),
-        input_pos,
-        max_new_tokens - 1,
-        temperature=temperature,
-        top_p=top_p,
-        repetition_penalty=repetition_penalty,
-        audio_masks=audio_masks,
-        audio_parts=audio_parts,
-        decode_one_token=decode_one_token,
-    )
-    seq = seq[:, : T + 1 + x.size(1)]
-    seq[:, T + 1 :] = x
-
-    # Clean up temporary variables
-    del first_token, x, prompt, empty, input_pos
-
-    return seq
+        del first_token, prompt, empty, input_pos
 
 
 def init_model(checkpoint_path, device, precision, compile=False):
@@ -460,13 +470,14 @@ def generate_long(
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
-        global_encoded = []
         seg_idx = 0
-        prompt_length = encoded.size(1)
+        total_tokens = 0
 
         t0 = time.perf_counter()
 
-        y = generate(
+        STREAMING_CHUNK_TOKENS = 20
+
+        for codes in generate(
             model=model,
             prompt=encoded,
             max_new_tokens=max_new_tokens,
@@ -476,20 +487,24 @@ def generate_long(
             temperature=temperature,
             top_p=top_p,
             repetition_penalty=repetition_penalty,
-        )
+            chunk_length=STREAMING_CHUNK_TOKENS,
+        ):
+            if sample_idx == 0 and seg_idx == 0 and compile:
+                logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
 
-        if sample_idx == 0 and seg_idx == 0 and compile:
-            logger.info(f"Compilation time: {time.perf_counter() - t0:.2f} seconds")
+            total_tokens += codes.size(1)
+            assert (codes >= 0).all(), f"Negative code found: {codes}"
+
+            yield GenerateResponse(action="sample", codes=codes, text=text)
+            seg_idx += 1
 
         if torch.cuda.is_available():
             torch.cuda.synchronize()
 
         t = time.perf_counter() - t0
-
-        tokens_generated = y.size(1) - prompt_length
-        tokens_sec = tokens_generated / t
+        tokens_sec = total_tokens / t if t > 0 else 0
         logger.info(
-            f"Generated {tokens_generated} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
+            f"Generated {total_tokens} tokens in {t:.02f} seconds, {tokens_sec:.02f} tokens/sec"
         )
         logger.info(f"Bandwidth achieved: {model_size * tokens_sec / 1e9:.02f} GB/s")
 
@@ -497,20 +512,6 @@ def generate_long(
             logger.info(
                 f"GPU Memory used: {torch.cuda.max_memory_reserved() / 1e9:.02f} GB"
             )
-
-        # Put the generated tokens
-        codes = y[1:, prompt_length:-1].clone()
-        assert (codes >= 0).all(), f"Negative code found"
-
-        decoded = y[:, prompt_length:].clone()
-        global_encoded.append(decoded.cpu())
-        assert (codes >= 0).all(), f"Negative code found: {codes}"
-
-        yield GenerateResponse(action="sample", codes=codes, text=text)
-        seg_idx += 1
-
-        # Force GPU memory cleanup
-        del y, decoded, codes
 
         yield GenerateResponse(action="next")
 

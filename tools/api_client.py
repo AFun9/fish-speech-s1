@@ -108,7 +108,7 @@ def parse_args():
     parser.add_argument(
         "--use_memory_cache",
         type=str,
-        default="off",
+        default="on",
         choices=["on", "off"],
         help="Cache encoded references codes in memory.\n",
     )

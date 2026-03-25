@@ -3,6 +3,7 @@ from hashlib import sha256
 from pathlib import Path
 from typing import Callable, Literal, Tuple
 
+import librosa
 import torch
 import torchaudio
 from loguru import logger
@@ -31,10 +32,10 @@ class ReferenceLoader:
         self.encode_reference: Callable
 
         # Define the torchaudio backend
-        backends = torchaudio.list_audio_backends()
-        if "ffmpeg" in backends:
-            self.backend = "ffmpeg"
-        else:
+        try:
+            backends = torchaudio.list_audio_backends()
+            self.backend = "ffmpeg" if "ffmpeg" in backends else "soundfile"
+        except AttributeError:
             self.backend = "soundfile"
 
     def load_by_id(
@@ -114,14 +115,27 @@ class ReferenceLoader:
             audio_data = reference_audio
             reference_audio = io.BytesIO(audio_data)
 
-        waveform, original_sr = torchaudio.load(reference_audio, backend=self.backend)
+        try:
+            waveform, original_sr = torchaudio.load(
+                reference_audio, backend=self.backend
+            )
+        except ImportError as e:
+            # TorchAudio 2.9+ delegates load() to TorchCodec; fall back to librosa.
+            if "torchcodec" not in str(e).lower():
+                raise
+            if isinstance(reference_audio, io.BytesIO):
+                reference_audio.seek(0)
+            y, original_sr = librosa.load(reference_audio, sr=None, mono=False)
+            waveform = torch.from_numpy(y).to(dtype=torch.float32)
+            if waveform.ndim == 1:
+                waveform = waveform.unsqueeze(0)
 
         if waveform.shape[0] > 1:
             waveform = torch.mean(waveform, dim=0, keepdim=True)
 
-        if original_sr != sr:
+        if int(original_sr) != sr:
             resampler = torchaudio.transforms.Resample(
-                orig_freq=original_sr, new_freq=sr
+                orig_freq=int(original_sr), new_freq=sr
             )
             waveform = resampler(waveform)
 

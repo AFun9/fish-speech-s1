@@ -90,6 +90,7 @@ filelists/
 
 # Cache and Temporary Files
 # --------------------------
+reference_cache/
 /.cache/
 /.gradio/
 /.locale/

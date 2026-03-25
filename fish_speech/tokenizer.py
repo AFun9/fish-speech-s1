@@ -146,18 +146,18 @@ class FishTokenizer:
     def decode(self, tokens: list[int]) -> str:
         return self.tkt_model.decode(tokens)
 
-    def save_pretrained(self, path: str):
-        path = Path(path)
-        path.mkdir(parents=True, exist_ok=True)
+    def save_pretrained(self, path: str) -> None:
+        out_dir = Path(path)
+        out_dir.mkdir(parents=True, exist_ok=True)
 
-        with open(path / "tokenizer.tiktoken", "w") as f:
+        with open(out_dir / "tokenizer.tiktoken", "w") as f:
             for token, rank in self.tkt_model._mergeable_ranks.items():
                 a = base64.b64encode(token).decode()
                 if a == "":
                     a = "="
                 f.write(f"{a} {rank}\n")
 
-        with open(path / "special_tokens.json", "w") as f:
+        with open(out_dir / "special_tokens.json", "w") as f:
             json.dump(
                 self.all_special_tokens_with_ids,
                 f,

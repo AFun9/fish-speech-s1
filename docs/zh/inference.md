@@ -21,7 +21,7 @@ hf download fishaudio/openaudio-s1-mini --local-dir checkpoints/openaudio-s1-min
 
 ```bash
 python fish_speech/models/dac/inference.py \
-    -i "ref_audio_name.wav" \
+    -i "assert/andelie.wav" \
     --checkpoint-path "checkpoints/openaudio-s1-mini/codec.pth"
 ```
 
@@ -31,8 +31,8 @@ python fish_speech/models/dac/inference.py \
 
 ```bash
 python fish_speech/models/text2semantic/inference.py \
-    --text "您想要转换的文本" \
-    --prompt-text "您的参考文本" \
+    --text "我能说中文了" \
+    --prompt-text "Здравствуйте, я Ханна, ваш автомобильный АИ помощник.Я помогу узнать погоду, построить маршрут, включить музыку и сделать поездку удобнее и безопаснее.Всегда рядом, чтобы помочь вам в дороге." \
     --prompt-tokens "fake.npy" \
     --compile
 ```
